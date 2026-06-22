@@ -205,6 +205,10 @@ pub fn download_files_for_alias(alias: &str) -> Result<&'static [(&'static str, 
                 "joiner-epoch-99-avg-1.int8.onnx",
             ),
             ("tokens.txt", "tokens.txt"),
+            // 熱詞（Feature 3a）需 cjkchar+bpe modeling unit 的 bpe.vocab。
+            // 只放下載清單、不放 required_files：缺檔不阻擋模型載入（熱詞自動跳過），
+            // 新下載才會帶上。檔案確認存在於 HF repo（~12KB）。
+            ("bpe.vocab", "bpe.vocab"),
         ]),
         _ => anyhow::bail!("unknown sherpa-onnx model alias: {alias}"),
     }

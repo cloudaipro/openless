@@ -93,10 +93,7 @@ pub(super) fn ensure_asr_credentials() -> Result<(), String> {
         }
     }
 
-    if is_whisper_compatible_provider(&active_asr)
-        || is_bailian_provider(&active_asr)
-        || is_mimo_provider(&active_asr)
-    {
+    if is_whisper_compatible_provider(&active_asr) || is_bailian_provider(&active_asr) {
         let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
             .ok()
             .flatten()
@@ -336,24 +333,64 @@ pub(super) fn is_mimo_provider(id: &str) -> bool {
     id == crate::asr::mimo::PROVIDER_ID
 }
 
+/// OpenCC `s2tw` 之後的逐字修正：少數字 s2tw 仍未落在台灣標準字。
+/// 例：「账」s2tw→貝部「賬」，但台標是巾部「帳」(帳號/帳單/記帳)；
+/// 台灣不用「賬」，一律修正。如有其他台標偏差，往這張表加即可。
+fn fix_taiwan_chars(text: &str) -> String {
+    if text.contains('賬') {
+        text.replace('賬', "帳")
+    } else {
+        text.to_string()
+    }
+}
+
+/// 快取 OpenCC 轉換器：`OpenCC::from_config` 每次都載入整套字典，成本高。
+/// 串流路徑每 ~12ms flush 一次會反覆呼叫，故按方向各快取一個（字典唯讀、執行緒安全）。
+/// `None` 表示該方向初始化失敗（缺字典 / 平台問題），呼叫端退回原文。
+fn cached_converter(config: BuiltinConfig) -> Option<&'static OpenCC> {
+    use std::sync::OnceLock;
+    static S2TW: OnceLock<Option<OpenCC>> = OnceLock::new();
+    static TW2S: OnceLock<Option<OpenCC>> = OnceLock::new();
+    let cell = match config {
+        BuiltinConfig::S2tw => &S2TW,
+        BuiltinConfig::Tw2s => &TW2S,
+        // 目前只有這兩個方向會用到（繁/簡偏好）。其他方向未支援快取。
+        _ => return None,
+    };
+    cell.get_or_init(|| match OpenCC::from_config(config) {
+        Ok(c) => Some(c),
+        Err(err) => {
+            log::warn!("[coord] OpenCC init failed ({config:?}), script conversion disabled: {err}");
+            None
+        }
+    })
+    .as_ref()
+}
+
 pub(super) fn apply_chinese_script_preference(text: &str, pref: ChineseScriptPreference) -> String {
     if text.is_empty() {
         return String::new();
     }
+    // 繁體一律走台灣標準字（S2tw：吃不會變喫、裡不會變裏）；
+    // 簡體走 Tw2s（台灣繁體→簡體）。跨平台（含 Ubuntu Linux），ferrous-opencc 在主 [dependencies]。
     let config = match pref {
-        ChineseScriptPreference::Simplified => Some(BuiltinConfig::T2s),
-        ChineseScriptPreference::Traditional => Some(BuiltinConfig::S2t),
+        ChineseScriptPreference::Simplified => Some(BuiltinConfig::Tw2s),
+        ChineseScriptPreference::Traditional => Some(BuiltinConfig::S2tw),
         ChineseScriptPreference::Auto => None,
     };
     let Some(config) = config else {
         return text.to_string();
     };
-    match OpenCC::from_config(config) {
-        Ok(converter) => converter.convert(text),
-        Err(err) => {
-            log::warn!("[coord] OpenCC init failed, skip script conversion: {err}");
-            text.to_string()
+    match cached_converter(config) {
+        Some(converter) => {
+            let converted = converter.convert(text);
+            // 台標逐字修正只對繁體輸出有意義（s2tw 漏網字）。
+            match pref {
+                ChineseScriptPreference::Traditional => fix_taiwan_chars(&converted),
+                _ => converted,
+            }
         }
+        None => text.to_string(),
     }
 }
 
@@ -464,6 +501,7 @@ pub(super) async fn build_qa_asr_start(inner: &Arc<Inner>, active_asr: &str) -> 
             model_alias,
             language_hint,
             token_handler,
+            enabled_phrases(inner),
         )
         .await
         .map_err(|e| format!("sherpa-onnx init failed: {e}"))?;
@@ -498,7 +536,10 @@ pub(super) async fn build_qa_asr_start(inner: &Arc<Inner>, active_asr: &str) -> 
         }),
         ActiveAsrProviderKind::Mimo => {
             let (api_key, base_url, model) = read_mimo_credentials();
-            let mimo = Arc::new(MimoBatchASR::new(api_key, base_url, model));
+            // 用户辞書を MiMo の語彙ヒント（chat text パート）にも流す。
+            let mimo_prompt =
+                crate::asr::whisper::build_prompt_from_phrases(&enabled_phrases(inner));
+            let mimo = Arc::new(MimoBatchASR::new(api_key, base_url, model, mimo_prompt));
             let active = ActiveAsr::Mimo(Arc::clone(&mimo));
             let consumer: Arc<dyn crate::recorder::AudioConsumer> = mimo;
             Ok(QaAsrStart::Ready { active, consumer })
@@ -529,5 +570,36 @@ pub(super) async fn build_qa_asr_start(inner: &Arc<Inner>, active_asr: &str) -> 
             )),
             bridge: Arc::new(DeferredAsrBridge::new()),
         }),
+    }
+}
+
+#[cfg(test)]
+mod script_pref_tests {
+    use super::apply_chinese_script_preference;
+    use crate::types::ChineseScriptPreference::{Auto, Simplified, Traditional};
+
+    #[test]
+    fn traditional_uses_taiwan_standard_chars() {
+        // s2tw 台標：吃≠喫、裡≠裏、為≠爲。一般 s2t 會給出右側的非台標字。
+        assert_eq!(apply_chinese_script_preference("吃饭", Traditional), "吃飯");
+        assert_eq!(apply_chinese_script_preference("这里", Traditional), "這裡");
+    }
+
+    #[test]
+    fn traditional_applies_zhang_char_fix() {
+        // 账：s2tw→賬(貝部)，台標應為帳(巾部)。fix_taiwan_chars 補正。
+        assert_eq!(apply_chinese_script_preference("账号", Traditional), "帳號");
+        assert_eq!(apply_chinese_script_preference("记账", Traditional), "記帳");
+    }
+
+    #[test]
+    fn simplified_converts_back() {
+        assert_eq!(apply_chinese_script_preference("這裡", Simplified), "这里");
+    }
+
+    #[test]
+    fn auto_is_passthrough() {
+        assert_eq!(apply_chinese_script_preference("吃饭", Auto), "吃饭");
+        assert_eq!(apply_chinese_script_preference("", Traditional), "");
     }
 }

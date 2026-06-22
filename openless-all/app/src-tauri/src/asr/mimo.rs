@@ -25,15 +25,21 @@ pub struct MimoBatchASR {
     api_key: String,
     base_url: String,
     model: String,
+    /// 用户辞書の有効フレーズから組んだ語彙ヒント（固有名詞バイアス）。
+    /// MiMo は OpenAI 互換 chat/completions なので、音声の前に text パートとして
+    /// 文脈投入する。`None` の場合はヒント無し。
+    /// 注意：MiMo 側のプロンプト・バイアス挙動は未検証。実機検証が必要。
+    prompt: Option<String>,
     buffer: Mutex<Vec<u8>>,
 }
 
 impl MimoBatchASR {
-    pub fn new(api_key: String, base_url: String, model: String) -> Self {
+    pub fn new(api_key: String, base_url: String, model: String, prompt: Option<String>) -> Self {
         Self {
             api_key,
             base_url,
             model,
+            prompt,
             buffer: Mutex::new(Vec::new()),
         }
     }
@@ -78,7 +84,7 @@ impl MimoBatchASR {
             .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         let wav = encode_wav_16k_mono(&samples);
-        let body = mimo_chat_body(&self.model, &wav);
+        let body = mimo_chat_body(&self.model, &wav, self.prompt.as_deref());
         let url = mimo_chat_completions_url(&self.base_url)?;
         let client = reqwest::Client::new();
         let resp = client
@@ -125,23 +131,33 @@ pub fn mimo_chat_completions_url(base_url: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-pub fn mimo_chat_body(model: &str, wav: &[u8]) -> Value {
+pub fn mimo_chat_body(model: &str, wav: &[u8], prompt: Option<&str>) -> Value {
     let audio_data = format!(
         "data:audio/wav;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(wav)
     );
+    let mut content = Vec::new();
+    // 語彙ヒントがあれば音声の前に text パートで投入。「出力するな」と明示して
+    // ヒント文がそのまま書き起こしに混入するのを抑える。
+    if let Some(hint) = prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": format!("參考詞彙（請勿輸出此行，僅用於辨識偏置）：{hint}"),
+        }));
+    }
+    content.push(serde_json::json!({
+        "type": "input_audio",
+        "input_audio": {
+            "data": audio_data,
+            "format": "wav",
+        },
+    }));
     serde_json::json!({
         "model": model,
         "stream": false,
         "messages": [{
             "role": "user",
-            "content": [{
-                "type": "input_audio",
-                "input_audio": {
-                    "data": audio_data,
-                    "format": "wav",
-                },
-            }],
+            "content": content,
         }],
     })
 }
@@ -279,8 +295,26 @@ mod tests {
     }
 
     #[test]
+    fn mimo_body_without_prompt_has_only_audio_part() {
+        let body = mimo_chat_body(DEFAULT_MODEL, b"wav", None);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_audio");
+    }
+
+    #[test]
+    fn mimo_body_with_prompt_prepends_text_hint() {
+        let body = mimo_chat_body(DEFAULT_MODEL, b"wav", Some("聲聲慢, ChatGPT"));
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("聲聲慢"));
+        assert_eq!(content[1]["type"], "input_audio");
+    }
+
+    #[test]
     fn mimo_body_uses_official_input_audio_shape() {
-        let body = mimo_chat_body(DEFAULT_MODEL, b"wav");
+        let body = mimo_chat_body(DEFAULT_MODEL, b"wav", None);
         assert_eq!(body["model"], DEFAULT_MODEL);
         assert_eq!(body["stream"], false);
         let audio = &body["messages"][0]["content"][0];
@@ -358,6 +392,7 @@ mod tests {
             "key".to_string(),
             format!("http://{}", addr),
             DEFAULT_MODEL.to_string(),
+            None,
         );
         asr.consume_pcm_chunk(&vec![0u8; 32_000]);
         let transcript = asr.transcribe().await.unwrap();
@@ -412,6 +447,7 @@ mod tests {
             "key".to_string(),
             format!("http://{}", addr),
             DEFAULT_MODEL.to_string(),
+            None,
         );
         let pcm = vec![0u8; 32_000 * 181];
         asr.consume_pcm_chunk(&pcm);

@@ -67,6 +67,10 @@ pub struct SherpaOnnxRuntime {
     lifecycle: AsyncMutex<()>,
     cancel_prepare: AtomicBool,
     state: Mutex<RuntimeState>,
+    /// 使用者辞書熱詞（Feature 3a）。在 online recognizer 載入時注入 sherpa
+    /// `hotwords_file`，偏置專有名詞辨識。載入時讀取一次；之後改熱詞需重載模型。
+    /// 跨平台欄位（非 Windows 平台忽略，因本地 sherpa 僅 Windows 可用）。
+    hotwords: Mutex<Vec<String>>,
 }
 
 impl Default for SherpaOnnxRuntime {
@@ -81,7 +85,14 @@ impl SherpaOnnxRuntime {
             lifecycle: AsyncMutex::new(()),
             cancel_prepare: AtomicBool::new(false),
             state: Mutex::new(RuntimeState::default()),
+            hotwords: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 設定熱詞清單（已啟用的辞書片語）。在模型載入「之前」呼叫才會生效；
+    /// 若模型已快取載入，需重載才會套用新熱詞。
+    pub fn set_hotwords(&self, words: Vec<String>) {
+        *self.hotwords.lock() = words;
     }
 
     /// 返回当前 runtime 是否真的具备推理能力。当前仅 Windows 接入
@@ -201,7 +212,8 @@ impl SherpaOnnxRuntime {
             Some(0.0),
             None,
         ));
-        let loaded = load_model(alias, &dir).await?;
+        let hotwords = self.hotwords.lock().clone();
+        let loaded = load_model(alias, &dir, &hotwords).await?;
         self.check_prepare_cancelled()?;
         progress(SherpaPrepareProgressPayload::new(
             SherpaPreparePhase::Load,
@@ -494,11 +506,14 @@ enum LoadedModel {
 }
 
 #[cfg(target_os = "windows")]
-async fn load_model(alias: &str, dir: &Path) -> Result<LoadedModel> {
+async fn load_model(alias: &str, dir: &Path, hotwords: &[String]) -> Result<LoadedModel> {
     let alias = alias.to_string();
     let dir = dir.to_path_buf();
+    let hotwords = hotwords.to_vec();
     tokio::task::spawn_blocking(move || match sherpa::mode_for_alias(&alias)? {
         SherpaMode::Offline => {
+            // Offline 引擎暫不接熱詞（多為非 transducer，sherpa 熱詞需 transducer +
+            // modified_beam_search）。
             let recognizer = create_offline_recognizer(&alias, &dir)?;
             Ok(LoadedModel::Offline(LoadedOfflineModel {
                 alias,
@@ -506,7 +521,7 @@ async fn load_model(alias: &str, dir: &Path) -> Result<LoadedModel> {
             }))
         }
         SherpaMode::Online => {
-            let recognizer = create_online_recognizer(&alias, &dir)?;
+            let recognizer = create_online_recognizer(&alias, &dir, &hotwords)?;
             Ok(LoadedModel::Online(LoadedOnlineModel {
                 alias,
                 recognizer: Arc::new(recognizer),
@@ -518,7 +533,7 @@ async fn load_model(alias: &str, dir: &Path) -> Result<LoadedModel> {
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn load_model(alias: &str, _dir: &Path) -> Result<LoadedModel> {
+async fn load_model(alias: &str, _dir: &Path, _hotwords: &[String]) -> Result<LoadedModel> {
     match sherpa::mode_for_alias(alias)? {
         SherpaMode::Offline => Ok(LoadedModel::Offline(LoadedOfflineModel {
             alias: alias.to_string(),
@@ -580,7 +595,11 @@ fn create_offline_recognizer(alias: &str, dir: &Path) -> Result<OfflineRecognize
 }
 
 #[cfg(target_os = "windows")]
-fn create_online_recognizer(alias: &str, dir: &Path) -> Result<OnlineRecognizer> {
+fn create_online_recognizer(
+    alias: &str,
+    dir: &Path,
+    hotwords: &[String],
+) -> Result<OnlineRecognizer> {
     let mut config = OnlineRecognizerConfig::default();
     config.model_config.num_threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(1, 4) as i32)
@@ -605,8 +624,63 @@ fn create_online_recognizer(alias: &str, dir: &Path) -> Result<OnlineRecognizer>
         }
         family => anyhow::bail!("sherpa-onnx family {family:?} is not supported by online ASR"),
     }
+    // 熱詞（Feature 3a）：fail-safe —— 任一步失敗就退回無熱詞 greedy_search，
+    // 絕不讓熱詞問題弄壞既有 ASR。
+    // 需求：sherpa-onnx 熱詞只在 transducer + modified_beam_search 下生效；
+    // 中英雙語 Zipformer 用 cjkchar+bpe modeling，需 bpe.vocab。
+    // 警告：本段為 Windows 限定且尚未經實機驗證，務必在 Windows build 上實測。
+    apply_hotwords(&mut config, dir, hotwords);
     OnlineRecognizer::create(&config)
         .ok_or_else(|| anyhow::anyhow!("create sherpa-onnx online recognizer failed"))
+}
+
+/// 把熱詞寫成 sherpa hotwords 檔並掛到 config（fail-safe，失敗即跳過）。
+///
+/// 格式：每行一個片語（自然文字）；sherpa 依 `modeling_unit` + `bpe_vocab` + tokens
+/// 自行切成建模單元。中英雙語 Zipformer 用 `cjkchar+bpe`，需 `bpe.vocab`。
+/// 缺 `bpe.vocab` 時不啟用熱詞（保持 greedy_search），避免破壞辨識。
+#[cfg(target_os = "windows")]
+fn apply_hotwords(config: &mut OnlineRecognizerConfig, dir: &Path, hotwords: &[String]) {
+    let phrases: Vec<&str> = hotwords
+        .iter()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if phrases.is_empty() {
+        return;
+    }
+    let bpe_vocab = dir.join("bpe.vocab");
+    if !bpe_vocab.is_file() {
+        log::warn!(
+            "[sherpa-asr] hotwords requested but bpe.vocab missing in {}; \
+             skipping hotwords (need cjkchar+bpe modeling unit)",
+            dir.display()
+        );
+        return;
+    }
+    let hotwords_path = dir.join("openless-hotwords.txt");
+    let body = format!("{}\n", phrases.join("\n"));
+    if let Err(e) = std::fs::write(&hotwords_path, body) {
+        log::warn!("[sherpa-asr] failed to write hotwords file, skipping hotwords: {e}");
+        return;
+    }
+    let (Ok(hotwords_file), Ok(bpe_path)) =
+        (path_to_string(&hotwords_path), path_to_string(&bpe_vocab))
+    else {
+        log::warn!("[sherpa-asr] hotwords/bpe path not UTF-8, skipping hotwords");
+        return;
+    };
+    config.model_config.modeling_unit = Some("cjkchar+bpe".into());
+    config.model_config.bpe_vocab = Some(bpe_path);
+    config.hotwords_file = Some(hotwords_file);
+    config.hotwords_score = 2.0;
+    config.max_active_paths = 4;
+    // 熱詞需 beam search；greedy 不支援。
+    config.decoding_method = Some("modified_beam_search".into());
+    log::info!(
+        "[sherpa-asr] hotwords enabled: {} phrase(s), modified_beam_search",
+        phrases.len()
+    );
 }
 
 fn model_family(alias: &str) -> Result<SherpaFamily> {

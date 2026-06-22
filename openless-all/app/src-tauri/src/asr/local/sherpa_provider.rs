@@ -76,8 +76,11 @@ impl SherpaOnnxAsr {
         model_alias: String,
         language_hint: Option<String>,
         token_handler: Option<SherpaTokenHandler>,
+        hotwords: Vec<String>,
     ) -> Result<Self> {
         if sherpa::alias_is_online(&model_alias) {
+            // 熱詞須在載入「之前」設好（Feature 3a，Windows online recognizer）。
+            runtime.set_hotwords(hotwords);
             let session = runtime.create_online_session(&model_alias).await?;
             Ok(Self {
                 runtime,

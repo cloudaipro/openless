@@ -193,7 +193,8 @@ async fn validate_mimo_asr_provider() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| crate::asr::mimo::DEFAULT_MODEL.to_string());
-    let asr = crate::asr::MimoBatchASR::new(config.api_key, config.base_url, model);
+    // 連線測試流程：無需辞書語彙提示。
+    let asr = crate::asr::MimoBatchASR::new(config.api_key, config.base_url, model, None);
     crate::recorder::AudioConsumer::consume_pcm_chunk(
         &asr,
         &encode_wav_16k_mono_silence(250)[44..],

@@ -24,8 +24,11 @@
  *    TranslationModifierEvent(uub: sym, states, isPress) — 翻译修饰键按下/抬起
  */
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <fcitx-config/configuration.h>
@@ -50,6 +53,32 @@
 FCITX_DEFINE_LOG_CATEGORY(openless, "openless");
 
 namespace fcitx {
+
+// 前端（Tauri/Rust）以小写名字（rightcontrol/leftalt/…）记录单一修饰键触发键，
+// 但 fcitx5 的 Key() 只认 X keysym 名（Control_R/Alt_L/…），直接传会解析失败
+// （日志 "invalid key 'rightcontrol'"），导致触发键失效 + 触发列表为空。
+// 这里把已知的前端单键名映射到 fcitx 名；带 '+' 的组合键或已是 fcitx 格式的
+// 字符串原样交给 Key() 解析。
+static std::string normalizeTriggerKeyName(const std::string &raw) {
+    std::string lower = raw;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    static const std::unordered_map<std::string, std::string> kAlias = {
+        {"rightcontrol", "Control_R"}, {"leftcontrol", "Control_L"},
+        {"rightalt", "Alt_R"},         {"leftalt", "Alt_L"},
+        {"rightoption", "Alt_R"},      {"leftoption", "Alt_L"},
+        {"rightshift", "Shift_R"},     {"leftshift", "Shift_L"},
+        {"rightsuper", "Super_R"},     {"leftsuper", "Super_L"},
+        {"rightcommand", "Super_R"},   {"leftcommand", "Super_L"},
+        {"rightmeta", "Super_R"},      {"leftmeta", "Super_L"},
+        {"rightwin", "Super_R"},       {"leftwin", "Super_L"},
+        {"capslock", "Caps_Lock"},
+        // Fn 无 X keysym；与 Rust trigger_to_keysym 一致映射到 Control_R。
+        {"fn", "Control_R"},
+    };
+    auto it = kAlias.find(lower);
+    return it == kAlias.end() ? raw : it->second;
+}
 
 FCITX_CONFIGURATION(OpenLessConfig,
     KeyListOption triggerKey{this,
@@ -112,13 +141,24 @@ public:
                     auto states = static_cast<uint32_t>(keyEvent.key().states());
                     bool isPress = !keyEvent.isRelease();
 
-                    // 自定义组合键：Alt 状态下字母 sym 可能大写（A vs a），归一化比较
-                    if (hasCustomDictationKey_ && states == static_cast<uint32_t>(customDictationKey_.states()) &&
+                    // 触发键本身是修饰键时，X11 在「该键自己的 release」事件里仍带着它的
+                    // 修饰位（press states=0、release states=Ctrl）。naive 的 states 相等
+                    // 比较会漏掉 release → DictationKeyEvent 只发 press 不发 release →
+                    // 录音停不下来（一直「收音中…」）。把触发键自身的修饰位从事件 states 里
+                    // 清掉再比较；非修饰键（组合键里的字母）keySymToStates 返回 0，行为不变。
+                    uint32_t selfMask =
+                        hasCustomDictationKey_
+                            ? static_cast<uint32_t>(Key::keySymToStates(customDictationKey_.sym()))
+                            : 0;
+                    uint32_t effStates = states & ~selfMask;
+                    // 自定义组合键：Alt/Shift 状态下字母 sym 可能大写（A vs a），归一化比较
+                    if (hasCustomDictationKey_ && effStates == static_cast<uint32_t>(customDictationKey_.states()) &&
                         (sym == static_cast<uint32_t>(customDictationKey_.sym()) ||
                          (sym >= 65 && sym <= 90 && sym + 32 == static_cast<uint32_t>(customDictationKey_.sym())) ||
                          (sym >= 97 && sym <= 122 && sym - 32 == static_cast<uint32_t>(customDictationKey_.sym())))) {
                         FCITX_LOGC(openless, Debug)
-                            << "Custom dictation: sym=" << sym << " states=" << states;
+                            << "Custom dictation: sym=" << sym << " states=" << states
+                            << " effStates=" << effStates << " isPress=" << isPress;
                         dictationKeyEvent(
                             static_cast<uint32_t>(customDictationKey_.sym()),
                             static_cast<uint32_t>(customDictationKey_.states()),
@@ -137,10 +177,22 @@ public:
                             }
                             return false;
                         }())) {
-                        auto dsym = triggerRawSym_ != 0 ? triggerRawSym_
-                            : static_cast<uint32_t>(triggerKeyList_[0].sym());
-                        auto dstates = triggerRawStates_ != 0 ? triggerRawStates_
-                            : static_cast<uint32_t>(triggerKeyList_[0].states());
+                        // dsym/dstates 必须同源：要么都取 raw（raw 路径命中），
+                        // 要么都取 triggerKeyList_[0]（list 路径命中，此时 list 必非空）。
+                        // 旧代码分别用 triggerRawSym_ / triggerRawStates_ 判断来源 ——
+                        // 当 raw sym 命中但 states 为 0（无修饰键的单键触发）时，dstates
+                        // 误走 list 分支去索引可能为空的 triggerKeyList_[0] → 越界崩溃，
+                        // 拖垮整个 fcitx5（自订触发键解析失败留下空 list 时必现）。
+                        uint32_t dsym;
+                        uint32_t dstates;
+                        if (triggerRawSym_ != 0) {
+                            dsym = triggerRawSym_;
+                            dstates = triggerRawStates_;
+                        } else {
+                            // list 路径命中 → 上面的循环保证 triggerKeyList_ 非空。
+                            dsym = static_cast<uint32_t>(triggerKeyList_[0].sym());
+                            dstates = static_cast<uint32_t>(triggerKeyList_[0].states());
+                        }
                         FCITX_LOGC(openless, Debug)
                             << "Dictation hotkey sym=" << dsym;
                         dictationKeyEvent(dsym, dstates, isPress);
@@ -348,10 +400,13 @@ public:
     }
 
     void setCustomDictationTrigger(const std::string &keyString) {
-        Key key(keyString);
+        // 前端单键名（rightcontrol/…）→ fcitx keysym 名（Control_R/…）。
+        std::string normalized = normalizeTriggerKeyName(keyString);
+        Key key(normalized);
         if (!key.isValid()) {
             FCITX_LOGC(openless, Warn)
-                << "SetCustomDictationTrigger: invalid key '" << keyString << "'";
+                << "SetCustomDictationTrigger: invalid key '" << keyString
+                << "' (normalized '" << normalized << "')";
             hasCustomDictationKey_ = false;
             return;
         }

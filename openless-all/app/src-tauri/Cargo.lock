@@ -3883,7 +3883,7 @@ dependencies = [
 
 [[package]]
 name = "openless"
-version = "1.3.11"
+version = "1.3.10"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3923,6 +3923,7 @@ dependencies = [
  "parking_lot",
  "raw-window-handle",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rustls",
  "serde",
